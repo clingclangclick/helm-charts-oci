@@ -1,0 +1,2 @@
+# dont generate archive of entire repo for releases
+** export-ignore

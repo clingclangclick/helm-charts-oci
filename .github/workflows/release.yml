@@ -1,0 +1,446 @@
+name: "Release"
+
+on:
+  pull_request:
+    types:
+    - closed
+
+jobs:
+  Changes:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.changed-directories.outputs.matrix }}
+      changes: ${{ steps.changed-directories.outputs.changes }}
+      has_ssh_deploy_private_key: ${{ steps.changed-directories.outputs.has_ssh_deploy_private_key }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+    - name: Changed Helm Chart Directories Matrix
+      id: changed-directories
+      env:
+        COMMIT_BASE: ${{ github.event.pull_request.base.sha }}
+        COMMIT_HEAD: ${{ github.event.pull_request.head.sha }}
+        EVENT: ${{ toJson(github.event) }}
+        HAS_SSH_DEPLOY_PRIVATE_KEY: ${{ secrets.SSH_DEPLOY_PRIVATE_KEY != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "${{ env.EVENT }}"
+
+        git_diff_tree_opts=( ${{ env.COMMIT_BASE }} ${{ env.COMMIT_HEAD }})
+        CHANGED_DIRECTORIES_FILE_SPEC="Chart.yaml"
+
+        # shellcheck disable=SC2068
+        matrix_json=$(jq -rRsc '
+            (. | {repositories: split("\n") | map(select(. != ""))} | tojson)
+          ' <<<"$(
+              while IFS= read -r dir
+              do
+                # Check if the file exists in the branch
+                if git ls-tree -r HEAD --name-only | grep -q "^${dir}/${CHANGED_DIRECTORIES_FILE_SPEC}$"
+                then
+                  echo "$dir"
+                fi
+              done <<<"$(git diff-tree --no-commit-id --name-only ${git_diff_tree_opts[@]} | cut -d/ -f1 - | sort -u)"
+            )"
+          )
+
+        (
+          printf "matrix=%s\n" "$matrix_json"
+          echo "changes=$(jq '.repositories != []' <<<"$matrix_json")"
+          echo "has_ssh_deploy_private_key=${HAS_SSH_DEPLOY_PRIVATE_KEY}"
+        ) >> "$GITHUB_OUTPUT"
+
+  Update:
+    runs-on: ubuntu-latest
+    if: needs.Changes.outputs.has_ssh_deploy_private_key == 'true'
+    permissions:
+      contents: 'write'
+    needs:
+      - Changes
+    outputs:
+      helm_updates_output: ${{ steps.helm-updates.outputs.output }}
+      git_commit_output: ${{ steps.git-commit.outputs.output }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+        persist-credentials: true
+        ref: main
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+        ssh-key: ${{ secrets.SSH_DEPLOY_PRIVATE_KEY }}
+
+    - name: Helm Docs Install
+      env:
+        HELM_DOCS_RELEASE_URL: "https://github.com/norwoodj/helm-docs/releases/download"
+        HELM_DOCS_VERSION: 1.11.3
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        curl -s -L "${HELM_DOCS_RELEASE_URL}/v${HELM_DOCS_VERSION}/helm-docs_${HELM_DOCS_VERSION}_Linux_x86_64.tar.gz" |
+          tar xvz -C /usr/local/bin/ helm-docs
+
+    - name: Helm Chart Updates
+      id: helm-updates
+      env:
+        REPOSITORY: ${{ toJson(needs.Changes.outputs.matrix) }}
+        HELM_DOCS_TEMPLATE_REL_PATH: "../.github/workflows/helm-docs/README.md.gotmpl"
+      shell: bash
+      run: |
+        set -eu
+
+        declare -a REPOSITORIES=()
+        count="$(jq '.repositories | length' <<< ${{ env.REPOSITORY }})"
+        for (( i=0; i < count; i++ ))
+        do
+          _repository="$(jq -r ".repositories[$i]" <<< ${{ env.REPOSITORY }})"
+          REPOSITORIES+=( "$_repository" )
+        done
+
+        declare -A HELM_DEPENDENCY_OUTPUTS HELM_DOCS_OUTPUTS
+        HELM_DEPENDENCY_FAILEDS=()
+        HELM_DOCS_FAILEDS=()
+
+        for repository in "${REPOSITORIES[@]}"
+        do
+          HELM_DEPENDENCY_OUTPUTS[$repository]="$(
+            helm dependency update "$repository"
+          )" || HELM_DEPENDENCY_FAILEDS+=( "$repository" )
+
+          HELM_DOCS_OUTPUTS[$repository]="$(
+            helm-docs -c "$repository" -l debug -t "${HELM_DOCS_TEMPLATE_REL_PATH}" -u 2>&1
+          )" || HELM_DOCS_FAILEDS+=( "$repository" )
+        done
+
+        HELM_DEPENDENCY_COMMENT="$(
+          echo '### Helm Dependency'
+          echo
+          if [ "${#HELM_DEPENDENCY_FAILEDS[@]}" -gt 0 ]
+          then
+            echo '***Failed***'
+            echo
+            for failed in "${HELM_DEPENDENCY_FAILEDS[@]}"
+            do
+              echo "* $failed"
+            done
+            echo
+          fi
+
+          for repository in "${REPOSITORIES[@]}"
+          do
+            echo '<details>'
+            echo
+            echo "<summary> $repository </summary>"
+            echo
+            echo '```shell'
+            echo "${HELM_DEPENDENCY_OUTPUTS[$repository]}"
+            echo '```'
+            echo
+            echo '</details>'
+            echo
+          done
+        )"
+
+        HELM_DOCS_COMMENT="$(
+          echo '### Helm Docs'
+          echo
+          if [ "${#HELM_DOCS_FAILEDS[@]}" -gt 0 ]
+          then
+            echo '***Failed***'
+            echo
+            for failed in "${HELM_DOCS_FAILEDS[@]}"
+            do
+              echo "* $failed"
+            done
+            echo
+          fi
+
+          for repository in "${REPOSITORIES[@]}"
+          do
+            echo '<details>'
+            echo
+            echo "<summary> $repository </summary>"
+            echo
+            echo '```shell'
+            echo "${HELM_DOCS_OUTPUTS[$repository]}"
+            echo '```'
+            echo
+            echo '</details>'
+            echo
+          done
+        )"
+
+        (
+          echo "failed=$(( "${#HELM_DEPENDENCY_FAILEDS[@]}" + "${#HELM_DOCS_FAILEDS[@]}" ))"
+          echo "helm_dependency_failed_count=${#HELM_DEPENDENCY_FAILEDS[@]}"
+          echo 'helm_dependency_comment<<EOF'
+          echo "$HELM_DEPENDENCY_COMMENT"
+          echo 'EOF'
+          echo "helm_docs_failed_count=${#HELM_DEPENDENCY_FAILEDS[@]}"
+          echo 'helm_docs_comment<<EOF'
+          echo "$HELM_DOCS_COMMENT"
+          echo 'EOF'
+          echo 'output<<EOF'
+          echo "$HELM_DEPENDENCY_COMMENT"
+          echo "$HELM_DOCS_COMMENT"
+          echo 'EOF'
+        ) >> "$GITHUB_OUTPUT"
+
+    - name: Helm Chart Update Failure
+      if: steps.helm-updates.outputs.failed != 0
+      uses: actions/github-script@v6
+      env:
+        OUTPUT: ${{ steps.helm-updates.outputs.output }}
+      with:
+        script: |
+            core.setFailed(process.env.OUTPUT)
+
+    - name: Commit Changes
+      id: git-commit
+      env:
+        REPOSITORY: ${{ toJson(needs.Changes.outputs.matrix) }}
+        SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+      shell: bash
+      run: |
+        set -eu
+
+        declare -a REPOSITORIES=()
+        count="$(jq '.repositories | length' <<< ${{ env.REPOSITORY }})"
+        for (( i=0; i < count; i++ ))
+        do
+          _repository="$(jq -r ".repositories[$i]" <<< ${{ env.REPOSITORY }})"
+          REPOSITORIES+=( "$_repository" )
+        done
+
+        EXIT_CODE=0
+        # shellcheck disable=SC2086
+        OUTPUT="$(
+          echo Config
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          echo
+
+          echo Add
+          for repository in "${REPOSITORIES[@]}"
+          do
+            git config --global --add safe.directory "$repository/*"
+            git add "$repository"
+          done
+
+          echo
+
+          echo Commit
+          git commit -m "[skip ci] Update Helm Charts"
+
+          echo
+
+          echo Push
+          git push -f origin main
+        ) || EXIT_CODE=$?"
+        (
+          echo "exit_code=$EXIT_CODE"
+          echo 'output<<EOF'
+          echo "$OUTPUT"
+          echo 'EOF'
+        ) >> "$GITHUB_OUTPUT"
+
+    - name: Commit Changes Failure
+      if: steps.git-commit.outputs.exit_code != 0
+      uses: actions/github-script@v6
+      env:
+        OUTPUT: ${{ steps.git-commit.outputs.output }}
+      with:
+        script: |
+            core.setFailed(process.env.OUTPUT)
+
+  Push:
+    runs-on: ubuntu-latest
+    if: always() && needs.Update.result == 'success' && needs.Changes.outputs.changes == 'true'
+    continue-on-error: true
+    strategy:
+      matrix: ${{fromJson(needs.Changes.outputs.matrix)}}
+    permissions:
+      contents: 'write'
+      packages: 'write'
+    needs:
+    - Changes
+    - Update
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+        fetch-depth: 0
+        fetch-tags: true
+        ref: main
+
+    - name: Package Helm Chart
+      id: helm-package
+      env:
+        REPOSITORY: ${{ matrix.repositories }}
+      shell: bash
+      run: |
+        set -eu
+
+        EXIT_CODE=0
+        # shellcheck disable=SC2086
+        OUTPUT="$(helm package "${REPOSITORY}") || EXIT_CODE=$?"
+        (
+          echo "exit_code=$EXIT_CODE"
+          echo 'output<<EOF'
+          echo "$OUTPUT"
+          echo 'EOF'
+        ) >> "$GITHUB_OUTPUT"
+  
+    - name: Helm Package Failure
+      if: steps.helm-package.outputs.exit_code != 0
+      uses: actions/github-script@v6
+      env:
+        OUTPUT: ${{ steps.helm-package.outputs.output }}
+      with:
+        script: |
+            core.setFailed(process.env.OUTPUT)
+  
+    - name: Tag
+      id: tag
+      env:
+        BODY: ${{ github.event.pull_request.body }}
+        REPOSITORY: ${{ matrix.repositories }}
+        TITLE: ${{ github.event.pull_request.title }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git config user.name "${{ github.actor }}"
+        git config user.email "${{ github.actor }}@users.noreply.github.com"
+        git fetch --tags --force origin 'refs/tags/*:refs/tags/*'
+
+        # Version sort is _not_ semver
+        CURRENT_TAG="$(git tag -l "$REPOSITORY/v*" 2>/dev/null | sort -Vr | head -n1)"
+        CURRENT_VERSION="${CURRENT_TAG##*/v}"
+        THIS_VERSION="$(yq '.version' "$REPOSITORY/Chart.yaml")"
+        TAG_VERSION="$REPOSITORY/v$THIS_VERSION"
+        (
+          echo previous_tag="${CURRENT_TAG:-$REPOSITORY/v0.0.0}"
+          echo previous_version="${CURRENT_VERSION:-0.0.0}"
+          echo tag="$TAG_VERSION"
+          echo version="$THIS_VERSION"
+        ) >> "$GITHUB_OUTPUT"
+
+        git tag -a -m "$TITLE" -m "$BODY" "$TAG_VERSION" ${{ github.sha }}
+        git push --follow-tags --force origin "$TAG_VERSION"
+
+    - name: Release
+      id: release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PREVIOUS_TAG: ${{ steps.tag.outputs.previous_tag }}
+        REPOSITORY: ${{ matrix.repositories }}
+        TAG: ${{ steps.tag.outputs.tag }}
+        VERSION: ${{ steps.tag.outputs.version }}
+      shell: bash
+      run: |
+        set -eu
+
+        gh_opts=(--generate-notes --target ${{ github.sha }} --verify-tag)
+        if [ "$PREVIOUS_TAG" != "$REPOSITORY/v0.0.0" ]; then
+          gh_opts+=(--notes-start-tag "$PREVIOUS_TAG")
+        fi
+
+        gh_opts+=("$REPOSITORY-$VERSION".tgz)
+        
+        # .gitattributes set to `export-ignore` to prevent repo being zipped for release
+        # shellcheck disable=SC2068
+        gh release create "$TAG" ${gh_opts[@]}
+
+    - name: Login to Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - name: Push Helm chart
+      id: helm-push
+      env:
+        REPOSITORY: ${{ matrix.repositories }}
+        VERSION: ${{ steps.tag.outputs.version }}
+      shell: bash
+      run: |
+        set -eu
+
+        EXIT_CODE=0
+        # shellcheck disable=SC2086
+        OUTPUT="$(helm push "$REPOSITORY-$VERSION.tgz" oci://ghcr.io/${{ github.repository }}) || EXIT_CODE=$?"
+        (
+          echo "exit_code=$EXIT_CODE"
+          echo 'output<<EOF'
+          echo "$OUTPUT"
+          echo 'EOF'
+        ) >> "$GITHUB_OUTPUT"
+
+    - name: Helm Push Failure
+      if: steps.helm-push.outputs.helm_push_exit_code != 0
+      uses: actions/github-script@v6
+      env:
+        OUTPUT: ${{ steps.helm-push.outputs.output }}
+      with:
+        script: |
+            core.setFailed(process.env.OUTPUT)
+
+    - name: Job Summary
+      shell: bash
+      env:
+        GIT_COMMIT_OUTPUT: ${{ needs.Update.outputs.git_commit_output }}
+        HELM_PACKAGE_OUTPUT: ${{ steps.helm-package.outputs.output }}
+        HELM_PUSH_OUTPUT: ${{ steps.helm-push.outputs.output }}
+        HELM_UPDATES_OUTPUT: ${{ needs.Update.outputs.helm_updates_output }}
+        REPOSITORY: ${{ matrix.repositories }}
+        VERSION: ${{ steps.tag.outputs.version }}
+      run: |
+        set -eu
+
+        (
+          echo '####Helm Chart Published'
+          echo
+          echo "#####${REPOSITORY-:UNKNOWN ERROR}"
+          echo
+          echo "Version: ${VERSION:-UNKNOWN ERROR}"
+          echo
+          echo '```shell'
+          echo "helm pull oci://ghcr.io/${{ github.repository }}/${REPOSITORY-:UNKNOWN ERROR} --version ${VERSION:-UNKNOWN ERROR}"
+          echo '```'
+          echo
+          echo "${HELM_UPDATES_OUTPUT:-UNKNOWN ERROR}"
+          echo
+          echo "${GIT_COMMIT_OUTPUT:-UNKNOWN ERROR}"
+          echo
+          echo '<details>'
+          echo
+          echo '<summary>Package</summary>'
+          echo
+          echo '```shell'
+          echo "${HELM_PACKAGE_OUTPUT:-UNKNOWN ERROR}"
+          echo '```'
+          echo
+          echo '</details>'
+          echo
+          echo '<details>'
+          echo
+          echo '<summary>Push</summary>'
+          echo
+          echo '```shell'
+          echo "${HELM_PUSH_OUTPUT:-UNKNOWN ERROR}"
+          echo '```'
+          echo
+          echo '</details>'
+          echo
+        ) >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,128 @@
+name: "Lint Helm Charts"
+
+on:
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    - ready_for_review
+    - reopened
+
+jobs:
+  Lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      pull-requests: 'write'
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+
+    - name: Changed Helm Chart Directories Matrix
+      id: changed-directories
+      env:
+        COMMIT_BASE: ${{ github.event.pull_request.base.sha }}
+        COMMIT_HEAD: ${{ github.event.pull_request.head.sha }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git_diff_tree_opts=( "${COMMIT_BASE}" "${COMMIT_HEAD}" )
+
+        CHANGED_DIRECTORIES_FILE_SPEC="Chart.yaml"
+        CHANGED_DIRECTORIES=()
+
+        # shellcheck disable=SC2068
+        while IFS= read -r dir
+        do
+            # Check if the file exists in the branch
+            if git ls-tree -r HEAD --name-only | grep -q "^${dir}/${CHANGED_DIRECTORIES_FILE_SPEC}$"; then
+            CHANGED_DIRECTORIES+=( "$dir" )
+            fi
+        done <<<"$(git diff-tree --no-commit-id --name-only ${git_diff_tree_opts[@]} | cut -d/ -f1 - | sort -u)"
+
+        (
+          echo "changed_directories=${CHANGED_DIRECTORIES[*]}"
+          echo "changed_directories_count=${#CHANGED_DIRECTORIES[@]}"
+        ) >> "$GITHUB_OUTPUT"
+
+    - name: Lint Helm Chart
+      id: helm-lint
+      if: steps.changed-directories.outputs.changed_directories_count > 0
+      env:
+        REPOSITORIES: ${{ steps.changed-directories.outputs.changed_directories }}
+      shell: bash
+      run: |
+        set -eux
+
+        # shellcheck disable=SC2206
+        declare -a HELM_LINT_REPOSITORIES=( $REPOSITORIES )
+        declare -A HELM_LINT_OUTPUT
+        HELM_LINT_FAILED=()
+
+        for repository in "${HELM_LINT_REPOSITORIES[@]}"
+        do
+          RC=0
+          HELM_LINT_OUTPUT["$repository"]="$(helm lint "$repository")" || RC="$?"
+          if [ "$RC" -ne 0 ]
+          then
+            HELM_LINT_FAILED+=( "$repository" )
+          fi
+        done
+
+        HELM_LINT_COMMENT="$(
+          echo '### Helm Lint'
+          echo
+          if [ "${#HELM_LINT_FAILED[@]}" -gt 0 ]
+          then
+            echo '***Failed***'
+            echo
+            for failed in "${HELM_LINT_FAILED[@]}"
+            do
+              echo "* $failed"
+            done
+            echo
+          fi
+
+          for repository in "${HELM_LINT_REPOSITORIES[@]}"
+          do
+            echo '<details>'
+            echo
+            echo "<summary> $repository </summary>"
+            echo
+            echo '```shell'
+            echo "${HELM_LINT_OUTPUT[$repository]}"
+            echo '```'
+            echo
+            echo '</details>'
+            echo
+          done
+        )"
+
+        (
+          echo "helm_lint_failed_count=${#HELM_LINT_FAILED[@]}"
+          echo 'helm_lint_comment<<EOF'
+          echo "${HELM_LINT_COMMENT//\`/\\\`}"
+          echo 'EOF'
+        ) >> "$GITHUB_OUTPUT"
+  
+    - name: Helm Lint Comment
+      if: steps.changed-directories.outputs.changed_directories_count > 0
+      uses: actions/github-script@v6
+      env:
+        HELM_LINT_COMMENT: ${{ steps.helm-lint.outputs.helm_lint_comment }}
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: process.env.HELM_LINT_COMMENT
+          })
+
+    - name: Helm Lint Result
+      if: steps.helm-lint.outputs.helm_lint_failed_count > 0
+      shell: bash
+      run: exit 1

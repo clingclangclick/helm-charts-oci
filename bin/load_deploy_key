@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+deployment_key_exists() {
+	local gh_deploy_key_comment
+	gh_deploy_key_comment="${1?Missing GH_DEPLOY_KEY_COMMENT arg 1}"
+	local read_only title
+	read -r read_only title < <(gh repo deploy-key list \
+		--json "readOnly,title" \
+		-q ".[] | select(.title == \"$gh_deploy_key_comment\") | [ .read_only, .title ] | @sh"
+	)
+	if [[ -n "$title" ]]
+	then
+		echo "$read_only" "$title"
+		return 0
+	else
+		echo
+		return 1
+	fi
+}
+
+local_key_generate() {
+	local gh_deploy_key
+	gh_deploy_key="${1?GH_DEPLOY_KEY Missing in arg 1}"
+	local gh_deploy_comment
+	gh_deploy_comment="${2?GH_DEPLOY_KEY_COMMENT Missing in arg 2}"
+	read -p "Local key $gh_deploy_key missing, Create? (Y/y) " -n 1 -r
+	echo
+	if [[ ! $REPLY =~ ^[Yy]$ ]]
+	then
+		# shellcheck disable=SC2128
+		[[ "$0" = "$BASH_SOURCE" ]] && exit 1 || return 1
+	fi
+	ssh-keygen -t ed25519 -C "$gh_deploy_comment" -f "$gh_deploy_key"
+}
+
+DEPLOY_KEYNAME="${DEPLOY_KEYNAME:-helm_charts_deploy_key}"
+GH_DEPLOY_KEY="${GH_DEPLOY_KEY:-"$HOME/.ssh/$DEPLOY_KEYNAME"}"
+GH_DEPLOY_KEY_COMMENT="${GH_DEPLOY_KEY_COMMENT:-Helm Chart Deploy Keyset for "$DEPLOY_KEYNAME"}"
+GH_SECRET_NAME="${GH_SECRET_NAME:-SSH_DEPLOY_PRIVATE_KEY}"
+
+read -r DEPLOYMENT_KEY_READ_ONLY DEPLOYMENT_KEY_TITLE < <(deployment_key_exists "$DEPLOY_KEYNAME") \
+	&& DEPLOYMENT_KEY_EXISTING_CODE=0 || DEPLOYMENT_KEY_EXISTING_CODE="$?"
+
+if [ "$DEPLOYMENT_KEY_EXISTING_CODE" -eq 0 ]
+then
+	echo "GitHub Deployment Key Title: $DEPLOYMENT_KEY_TITLE"
+	echo "GitHub Deployment Key Read-Only: $DEPLOYMENT_KEY_READ_ONLY"
+	if [ "$DEPLOYMENT_KEY_READ_ONLY" == "true" ]
+	then
+		echo "Deployment key exists, but is read-only, cannot continue"
+		exit 1
+	fi
+	if [ ! -f "$GH_DEPLOY_KEY" ]
+	then
+		echo "Deployment key exists, but no local key found, exiting"
+		exit 1
+	fi
+else
+	if [ ! -f "$GH_DEPLOY_KEY" ]
+	then
+		if local_key_generate "$GH_DEPLOY_KEY" "$GH_DEPLOY_KEY_COMMENT"
+		then
+            echo "Created deploy key $GH_DEPLOY_KEY with comment $GH_DEPLOY_KEY_COMMENT"
+		else
+			echo "Error creating deployment key, exiting"
+			exit 1
+		fi
+	fi
+fi
+
+if ! gh secret set -a actions "$GH_SECRET_NAME" < "$GH_DEPLOY_KEY"
+then
+    echo "Could not set secret $GH_SECRET_NAME"
+    exit 1
+fi
+echo "Set secret $GH_SECRET_NAME to value of $GH_DEPLOY_KEY file"
