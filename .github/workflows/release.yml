@@ -195,7 +195,7 @@ jobs:
 
     - name: Helm Chart Update Failure
       if: steps.helm-updates.outputs.failed != 0
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       env:
         OUTPUT: ${{ steps.helm-updates.outputs.output }}
       with:
@@ -254,7 +254,7 @@ jobs:
 
     - name: Commit Changes Failure
       if: steps.git-commit.outputs.exit_code != 0
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       env:
         OUTPUT: ${{ steps.git-commit.outputs.output }}
       with:
@@ -302,7 +302,7 @@ jobs:
   
     - name: Helm Package Failure
       if: steps.helm-package.outputs.exit_code != 0
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       env:
         OUTPUT: ${{ steps.helm-package.outputs.output }}
       with:
@@ -389,7 +389,7 @@ jobs:
 
     - name: Helm Push Failure
       if: steps.helm-push.outputs.helm_push_exit_code != 0
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       env:
         OUTPUT: ${{ steps.helm-push.outputs.output }}
       with:
