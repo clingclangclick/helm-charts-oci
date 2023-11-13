@@ -110,7 +110,7 @@ jobs:
   
     - name: Helm Lint Comment
       if: steps.changed-directories.outputs.changed_directories_count > 0
-      uses: actions/github-script@v6
+      uses: actions/github-script@v7
       env:
         HELM_LINT_COMMENT: ${{ steps.helm-lint.outputs.helm_lint_comment }}
       with:
